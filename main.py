@@ -899,7 +899,6 @@ def _build_kiro_request(messages: List[dict], model: str, access_token: str, acc
                 history.append({
                     "userInputMessage": {
                         "content": msg["content"],
-                        "modelId": "CLAUDE_SONNET_V4_0",
                         "origin": "AI_EDITOR",
                     }
                 })
@@ -928,7 +927,6 @@ def _build_kiro_request(messages: List[dict], model: str, access_token: str, acc
             "currentMessage": {
                 "userInputMessage": {
                     "content": current_content,
-                    "modelId": "CLAUDE_SONNET_V4_0",
                     "origin": "AI_EDITOR",
                 }
             },
@@ -937,6 +935,10 @@ def _build_kiro_request(messages: List[dict], model: str, access_token: str, acc
 
     if history:
         payload["conversationState"]["history"] = history
+        # History entries also need origin but NOT modelId
+        for entry in history:
+            if "userInputMessage" in entry:
+                entry["userInputMessage"].pop("modelId", None)
 
     if account.profile_arn:
         payload["profileArn"] = account.profile_arn
