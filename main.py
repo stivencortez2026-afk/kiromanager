@@ -36,7 +36,6 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 ACCOUNT_COOLDOWN = int(os.getenv("ACCOUNT_COOLDOWN_SECONDS", "300"))
 REGION = os.getenv("KIRO_REGION", "us-east-1")
-DATA_DIR = os.getenv("DATA_DIR", "./data")
 
 # URLs Kiro
 KIRO_REFRESH_URL = f"https://prod.{REGION}.auth.desktop.kiro.dev/refreshToken"
@@ -75,48 +74,56 @@ def get_fingerprint() -> str:
 FINGERPRINT = get_fingerprint()
 
 
-# ─── Persistência JSON ─────────────────────────────────────────────────────────
+# ─── Persistência Redis (Upstash) ──────────────────────────────────────────────
 
-ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
-API_KEYS_FILE = os.path.join(DATA_DIR, "api_keys.json")
+import redis
+
+REDIS_URL = os.getenv("REDIS_URL", "")
+
+_redis_client = None
 
 
-def _ensure_data_dir():
-    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+def get_redis():
+    global _redis_client
+    if _redis_client is None and REDIS_URL:
+        _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    return _redis_client
 
 
 def load_accounts_from_disk() -> List[dict]:
-    _ensure_data_dir()
-    if not os.path.exists(ACCOUNTS_FILE):
+    r = get_redis()
+    if not r:
         return []
     try:
-        with open(ACCOUNTS_FILE, "r") as f:
-            return json.load(f)
+        data = r.get("kiro:accounts")
+        return json.loads(data) if data else []
     except Exception:
         return []
 
 
 def save_accounts_to_disk(accounts_data: List[dict]):
-    _ensure_data_dir()
-    with open(ACCOUNTS_FILE, "w") as f:
-        json.dump(accounts_data, f, indent=2)
+    r = get_redis()
+    if not r:
+        return
+    r.set("kiro:accounts", json.dumps(accounts_data))
 
 
 def load_api_keys_from_disk() -> List[dict]:
-    _ensure_data_dir()
-    if not os.path.exists(API_KEYS_FILE):
+    r = get_redis()
+    if not r:
         return []
     try:
-        with open(API_KEYS_FILE, "r") as f:
-            return json.load(f)
+        data = r.get("kiro:api_keys")
+        return json.loads(data) if data else []
     except Exception:
         return []
 
 
 def save_api_keys_to_disk(keys_data: List[dict]):
-    _ensure_data_dir()
-    with open(API_KEYS_FILE, "w") as f:
-        json.dump(keys_data, f, indent=2)
+    r = get_redis()
+    if not r:
+        return
+    r.set("kiro:api_keys", json.dumps(keys_data))
 
 
 # ─── API Key Manager ──────────────────────────────────────────────────────────
