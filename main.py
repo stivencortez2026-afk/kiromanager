@@ -874,9 +874,8 @@ async def chat_completions(request: Request):
 
 def _build_kiro_request(messages: List[dict], model: str, access_token: str, account: KiroAccount):
     """Monta request no formato Kiro API (generateAssistantResponse)."""
-    # Converte mensagens para formato Kiro
-    kiro_history = []
     system_text = ""
+    conv_messages = []
 
     for msg in messages:
         role = msg.get("role", "user")
@@ -885,57 +884,62 @@ def _build_kiro_request(messages: List[dict], model: str, access_token: str, acc
             content = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
         if not content:
             continue
-
         if role == "system":
             system_text += content + "\n"
-        elif role == "user":
-            kiro_history.append({
-                "userInputMessage": {
-                    "content": content,
-                    "userIntent": "CHAT",
-                }
-            })
-        elif role == "assistant":
-            kiro_history.append({
-                "assistantResponseMessage": {
-                    "content": content,
-                }
-            })
-
-    # A última mensagem do user é o currentMessage
-    current_message = None
-    history = []
-
-    for i, entry in enumerate(kiro_history):
-        if i == len(kiro_history) - 1 and "userInputMessage" in entry:
-            current_message = entry
         else:
-            history.append(entry)
+            conv_messages.append({"role": role, "content": content})
 
-    if not current_message:
-        # Fallback: pega a última mensagem como current
-        last_content = messages[-1].get("content", "Olá") if messages else "Olá"
-        if isinstance(last_content, list):
-            last_content = " ".join(p.get("text", "") for p in last_content if p.get("type") == "text")
-        current_message = {
-            "userInputMessage": {
-                "content": last_content,
-                "userIntent": "CHAT",
-            }
-        }
+    # Build history (tudo menos a última mensagem)
+    history = []
+    current_content = "Hello"
 
-    # Se tem system prompt, injeta no content do current message
+    if conv_messages:
+        for i, msg in enumerate(conv_messages[:-1]):
+            if msg["role"] == "user":
+                history.append({
+                    "userInputMessage": {
+                        "content": msg["content"],
+                        "modelId": "CLAUDE_SONNET_V4_0",
+                        "origin": "AI_EDITOR",
+                    }
+                })
+            elif msg["role"] == "assistant":
+                history.append({
+                    "assistantResponseMessage": {
+                        "content": msg["content"],
+                    }
+                })
+
+        # Última mensagem = currentMessage
+        last = conv_messages[-1]
+        current_content = last["content"]
+
+    # Injeta system prompt no conteúdo
     if system_text:
-        original = current_message["userInputMessage"]["content"]
-        current_message["userInputMessage"]["content"] = f"[System Instructions]: {system_text.strip()}\n\n[User Message]: {original}"
+        current_content = f"{system_text.strip()}\n\n{current_content}"
+
+    # conversationId
+    conv_id = uuid.uuid4().hex
 
     payload = {
         "conversationState": {
             "chatTriggerType": "MANUAL",
-            "currentMessage": current_message,
-            "history": history,
-        },
+            "conversationId": conv_id,
+            "currentMessage": {
+                "userInputMessage": {
+                    "content": current_content,
+                    "modelId": "CLAUDE_SONNET_V4_0",
+                    "origin": "AI_EDITOR",
+                }
+            },
+        }
     }
+
+    if history:
+        payload["conversationState"]["history"] = history
+
+    if account.profile_arn:
+        payload["profileArn"] = account.profile_arn
 
     headers = {
         "Authorization": f"Bearer {access_token}",
