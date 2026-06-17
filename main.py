@@ -480,7 +480,7 @@ button.danger:hover { background: #f44336; }
 <body>
 <div class="container">
 <h1>Kiro Gateway Admin</h1>
-<p class="subtitle">Gerencie suas contas Kiro em tempo real</p>
+<p class="subtitle">Gerencie suas contas Kiro <button onclick="loadData()" style="margin-left:15px;font-size:0.85em;padding:6px 14px;">🔄 Atualizar</button></p>
 <div id="message"></div>
 """
 
@@ -638,7 +638,7 @@ function showMsg(t, err) {
   setTimeout(() => { m.style.display = "none"; m.className = ""; }, 4000);
 }
 
-loadData(); setInterval(loadData, 10000);
+loadData();
 </script>
 </body></html>"""
 
