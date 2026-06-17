@@ -873,36 +873,69 @@ async def chat_completions(request: Request):
 # ─── Build Kiro Request ────────────────────────────────────────────────────────
 
 def _build_kiro_request(messages: List[dict], model: str, access_token: str, account: KiroAccount):
-    """Monta request no formato Kiro API."""
-    # Converte mensagens OpenAI → Kiro
-    kiro_msgs = []
+    """Monta request no formato Kiro API (generateAssistantResponse)."""
+    # Converte mensagens para formato Kiro
+    kiro_history = []
+    system_text = ""
+
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if isinstance(content, list):
-            # Multimodal - extrai texto
             content = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
+        if not content:
+            continue
+
         if role == "system":
-            kiro_msgs.append({"role": "user", "content": [{"text": f"[System]: {content}"}]})
+            system_text += content + "\n"
         elif role == "user":
-            kiro_msgs.append({"role": "user", "content": [{"text": content}]})
+            kiro_history.append({
+                "userInputMessage": {
+                    "content": content,
+                    "userIntent": "CHAT",
+                }
+            })
         elif role == "assistant":
-            kiro_msgs.append({"role": "assistant", "content": [{"text": content}]})
+            kiro_history.append({
+                "assistantResponseMessage": {
+                    "content": content,
+                }
+            })
+
+    # A última mensagem do user é o currentMessage
+    current_message = None
+    history = []
+
+    for i, entry in enumerate(kiro_history):
+        if i == len(kiro_history) - 1 and "userInputMessage" in entry:
+            current_message = entry
+        else:
+            history.append(entry)
+
+    if not current_message:
+        # Fallback: pega a última mensagem como current
+        last_content = messages[-1].get("content", "Olá") if messages else "Olá"
+        if isinstance(last_content, list):
+            last_content = " ".join(p.get("text", "") for p in last_content if p.get("type") == "text")
+        current_message = {
+            "userInputMessage": {
+                "content": last_content,
+                "userIntent": "CHAT",
+            }
+        }
+
+    # Se tem system prompt, injeta no content do current message
+    if system_text:
+        original = current_message["userInputMessage"]["content"]
+        current_message["userInputMessage"]["content"] = f"[System Instructions]: {system_text.strip()}\n\n[User Message]: {original}"
 
     payload = {
         "conversationState": {
             "chatTriggerType": "MANUAL",
-            "currentMessage": {
-                "userInputMessage": {
-                    "content": kiro_msgs[-1]["content"] if kiro_msgs else [{"text": ""}],
-                    "userIntent": "CHAT",
-                },
-            },
-            "history": kiro_msgs[:-1] if len(kiro_msgs) > 1 else [],
+            "currentMessage": current_message,
+            "history": history,
         },
     }
-    if model and model != "auto":
-        payload["modelId"] = model
 
     headers = {
         "Authorization": f"Bearer {access_token}",
