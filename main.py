@@ -86,7 +86,7 @@ _redis_client = None
 def get_redis():
     global _redis_client
     if _redis_client is None and REDIS_URL:
-        _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        _redis_client = redis.from_url(REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
     return _redis_client
 
 
@@ -524,13 +524,14 @@ ADMIN_HTML2 = """
 </div>
 </div>
 <script>
-const API_KEY = prompt("Digite a senha admin (GATEWAY_API_KEY):", "");
+const API_KEY = localStorage.getItem("kiro_admin_key") || prompt("Digite a senha admin (GATEWAY_API_KEY):", "");
+if (API_KEY) localStorage.setItem("kiro_admin_key", API_KEY);
 const H = {"X-API-Key": API_KEY, "Content-Type": "application/json"};
 
 async function loadData() {
   try {
     const r = await fetch("/admin/api/stats", {headers: H});
-    if (r.status === 401) { showMsg("Senha incorreta!", true); return; }
+    if (r.status === 401) { localStorage.removeItem("kiro_admin_key"); showMsg("Senha incorreta! Recarregue a página.", true); return; }
     const d = await r.json();
     document.getElementById("stats").innerHTML = `
       <div class="stat"><div class="number">${d.total}</div><div class="label">Total Contas</div></div>
