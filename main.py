@@ -785,10 +785,8 @@ async def anthropic_messages(request: Request):
             access_token = await account.get_access_token()
             url, headers, payload = _build_kiro_request(messages, model, access_token, account)
 
-            if stream:
-                return await _do_stream_anthropic(url, headers, payload, account, model)
-            else:
-                return await _do_normal_anthropic(url, headers, payload, account, model)
+            # Sempre usa modo non-streaming para garantir parsing correto
+            return await _do_normal_anthropic(url, headers, payload, account, model)
 
         except AccountExhaustedException as e:
             last_error = str(e)
