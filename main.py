@@ -402,6 +402,11 @@ class AccountPool:
         return acc
 
     def disable_account(self, acc: KiroAccount, reason: str = ""):
+        # Não desabilita para erros 500 (temporários do Kiro)
+        if "HTTP 500" in reason or "unexpected error" in reason.lower():
+            acc.last_error = reason
+            logger.warning(f"[{acc.id}] Erro temporário (não desabilitado): {reason}")
+            return
         acc.errors += 1
         acc.disabled = True
         acc.disabled_at = time.time()
@@ -807,7 +812,7 @@ async def anthropic_messages(request: Request):
     raise HTTPException(502, f"Todas tentativas falharam: {last_error}")
 
 
-# ─── Chat Completions (OpenAI format) ─────────────────────────────────────────
+# ─── Build Kiro Request ─────────────────────────────────────────
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(request: Request):
