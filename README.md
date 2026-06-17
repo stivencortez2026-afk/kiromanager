@@ -1,120 +1,151 @@
-# Kiro API Gateway
+# Kiro Multi-Account Gateway
 
-API Gateway centralizado com Load Balancing para gerenciar múltiplas contas Kiro.
+Gateway centralizado que transforma múltiplas contas Kiro em uma API compatível com OpenAI.
+
+## Como funciona
+
+1. Você loga em várias contas Kiro (gratuitas ou pagas)
+2. Extrai o `refreshToken` de cada uma
+3. Configura neste gateway
+4. O gateway faz Round Robin entre as contas, refresh automático de tokens, e failover
 
 ## Funcionalidades
 
-- **Round Robin Load Balancing** - Distribui requisições entre múltiplas contas Kiro
-- **Failover Automático** - Se uma conta falha (429, 401, 403), pula para a próxima
-- **Streaming (SSE)** - Respostas em tempo real para evitar timeout no Claude Desktop
-- **Autenticação Interna** - Protege o gateway com X-API-Key
-- **Cooldown Automático** - Contas desabilitadas são reativadas após 5 minutos
-- **Health Check** - Endpoint `/health` para monitoramento do Render
+- **OpenAI Compatible** - Endpoint `/v1/chat/completions` funciona com qualquer cliente OpenAI
+- **Multi-Account Pool** - Round Robin entre N contas
+- **Auto Token Refresh** - Refresh automático quando token expira (a cada ~1h)
+- **Failover** - Se conta dá erro/esgota, pula pra próxima
+- **Streaming (SSE)** - Respostas em tempo real
+- **Cooldown** - Contas com erro voltam após 5 min
+
+## Como obter o Refresh Token
+
+### Método 1: Arquivo de cache (mais fácil)
+
+1. Instale o Kiro IDE e faça login (Google/GitHub)
+2. Encontre o arquivo:
+   - **Windows**: `%APPDATA%\Kiro\User\globalStorage\` ou `%USERPROFILE%\.aws\sso\cache\kiro-auth-token.json`
+   - **macOS**: `~/Library/Application Support/Kiro/User/globalStorage/` ou `~/.aws/sso/cache/kiro-auth-token.json`
+   - **Linux**: `~/.config/Kiro/User/globalStorage/` ou `~/.aws/sso/cache/kiro-auth-token.json`
+3. Copie o valor de `refreshToken`
+
+### Método 2: DevTools do Kiro IDE
+
+1. No Kiro IDE, abra DevTools (Help → Toggle Developer Tools)
+2. Na aba Network, filtre por `refreshToken`
+3. Copie o refresh token da request/response
 
 ## Deploy no Render.com
 
-### 1. Push para GitHub
+### 1. Push para GitHub (já feito!)
 
-```bash
-git init
-git add .
-git commit -m "Initial commit: Kiro API Gateway"
-git remote add origin https://github.com/SEU_USER/kiro-gateway.git
-git push -u origin main
+O código já está em: https://github.com/stivencortez2026-afk/kiromanager
+
+### 2. Criar Web Service no Render
+
+1. [render.com](https://render.com) → New → Web Service
+2. Conecte o repo `kiromanager`
+3. Configure as variáveis de ambiente:
+
+### 3. Variáveis de Ambiente
+
+**Obrigatórias:**
+
+| Variável | Descrição |
+|----------|-----------|
+| `KIRO_ACCOUNTS` | JSON com suas contas (veja formato abaixo) |
+| `GATEWAY_API_KEY` | Chave que VOCÊ inventa para proteger o gateway |
+
+**Formato do `KIRO_ACCOUNTS`:**
+
+```json
+[
+  {"refresh_token": "SEU_REFRESH_TOKEN_CONTA_1", "profile_arn": ""},
+  {"refresh_token": "SEU_REFRESH_TOKEN_CONTA_2", "profile_arn": ""},
+  {"refresh_token": "SEU_REFRESH_TOKEN_CONTA_3", "profile_arn": ""}
+]
 ```
 
-### 2. Conectar ao Render
+**Alternativa simples (só tokens):**
 
-1. Acesse [render.com](https://render.com) e crie um **Web Service**
-2. Conecte o repositório GitHub
-3. O Render detectará o `render.yaml` automaticamente
+```
+KIRO_REFRESH_TOKENS=token1,token2,token3
+```
 
-### 3. Configurar Variáveis de Ambiente
-
-No painel do Render, adicione:
-
-| Variável | Descrição | Exemplo |
-|----------|-----------|---------|
-| `KIRO_TOKENS` | Tokens separados por vírgula | `token1,token2,token3` |
-| `GATEWAY_API_KEY` | Chave de acesso ao gateway | `minha-chave-secreta-123` |
-| `KIRO_BASE_URL` | URL base da API Kiro | `https://api.kiro.dev` |
-
-Opcionais:
+**Opcionais:**
 
 | Variável | Default | Descrição |
 |----------|---------|-----------|
-| `MAX_RETRIES` | `3` | Tentativas antes de falhar |
-| `REQUEST_TIMEOUT` | `120` | Timeout em segundos |
-| `ACCOUNT_COOLDOWN_SECONDS` | `300` | Tempo para reativar conta |
-| `WEB_CONCURRENCY` | `2` | Número de workers |
+| `KIRO_REGION` | `us-east-1` | Região AWS |
+| `MAX_RETRIES` | `3` | Tentativas por request |
+| `REQUEST_TIMEOUT` | `300` | Timeout em segundos |
+| `ACCOUNT_COOLDOWN_SECONDS` | `300` | Cooldown de conta com erro |
 
-### Formatos de Token
+## Uso com Clientes OpenAI
 
-**Opção A** - Variável única (recomendado):
-```
-KIRO_TOKENS=token_abc123,token_def456,token_ghi789
-```
-
-**Opção B** - Variáveis separadas:
-```
-KIRO_TOKEN_1=token_abc123
-KIRO_TOKEN_2=token_def456
-KIRO_TOKEN_3=token_ghi789
-```
-
-## Uso nos Notebooks
-
-Configure seus notebooks remotos para apontar para o gateway:
+### Python (OpenAI SDK)
 
 ```python
-import requests
+from openai import OpenAI
 
-GATEWAY_URL = "https://kiro-gateway.onrender.com"
-API_KEY = "minha-chave-secreta-123"
+client = OpenAI(
+    base_url="https://kiromanager.onrender.com/v1",
+    api_key="SUA_GATEWAY_API_KEY",  # O que você definiu em GATEWAY_API_KEY
+)
 
-response = requests.post(
-    f"{GATEWAY_URL}/v1/messages",
-    headers={
-        "X-API-Key": API_KEY,
-        "Content-Type": "application/json",
-    },
-    json={"model": "claude-3-5-sonnet", "messages": [...]},
+response = client.chat.completions.create(
+    model="claude-sonnet-4",
+    messages=[{"role": "user", "content": "Olá!"}],
     stream=True,
 )
 
-for chunk in response.iter_content():
-    print(chunk.decode(), end="")
+for chunk in response:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="")
+```
+
+### Claude Desktop / Continue.dev
+
+Configure como provedor OpenAI-compatible:
+- Base URL: `https://kiromanager.onrender.com/v1`
+- API Key: Sua `GATEWAY_API_KEY`
+
+### curl
+
+```bash
+curl https://kiromanager.onrender.com/v1/chat/completions \
+  -H "X-API-Key: SUA_GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4",
+    "messages": [{"role": "user", "content": "Olá!"}],
+    "stream": true
+  }'
 ```
 
 ## Endpoints
 
 | Método | Path | Auth | Descrição |
 |--------|------|------|-----------|
-| GET | `/health` | Não | Health check + stats |
-| GET | `/stats` | Sim | Estatísticas detalhadas |
-| ANY | `/{path}` | Sim | Proxy para API Kiro |
+| GET | `/health` | Não | Health check |
+| GET | `/stats` | Sim | Estatísticas do pool |
+| GET | `/v1/models` | Sim | Lista modelos |
+| POST | `/v1/chat/completions` | Sim | Chat (OpenAI format) |
 
-## Monitoramento
+## Modelos Disponíveis
 
-Acesse `/health` para ver o status do pool:
+- `auto` - Modelo padrão do plano
+- `claude-sonnet-4` - Claude Sonnet 4
+- `claude-sonnet-4.5` - Claude Sonnet 4.5
+- `claude-haiku-4.5` - Claude Haiku 4.5
+- `claude-opus-4.5` - Claude Opus 4.5 (requer plano pago)
+- `claude-3.7-sonnet` - Claude 3.7 Sonnet (legacy)
 
-```json
-{
-  "status": "healthy",
-  "pool": {
-    "total_accounts": 3,
-    "active_accounts": 2,
-    "disabled_accounts": ["account_2"],
-    "total_requests_served": 147
-  }
-}
-```
-
-## Desenvolvimento Local
+## Dev Local
 
 ```bash
 pip install -r requirements.txt
-export KIRO_TOKENS="token1,token2"
-export GATEWAY_API_KEY="dev-key"
+set KIRO_REFRESH_TOKENS=seu_token_aqui
+set GATEWAY_API_KEY=dev-key
 uvicorn main:app --reload --port 8000
 ```
