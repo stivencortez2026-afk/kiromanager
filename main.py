@@ -650,6 +650,75 @@ async def list_models():
     return {"object": "list", "data": models}
 
 
+# ─── /v1/messages (Anthropic format) ──────────────────────────────────────────
+
+@app.post("/v1/messages", dependencies=[Depends(verify_api_key)])
+async def anthropic_messages(request: Request):
+    """Endpoint Anthropic-compatible (/v1/messages) para Claude Desktop."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "JSON inválido")
+
+    messages = body.get("messages", [])
+    model = body.get("model", "auto")
+    stream = body.get("stream", False)
+    system_msg = body.get("system", "")
+
+    if not messages:
+        raise HTTPException(400, "'messages' obrigatório")
+
+    # Prepend system message se existir
+    if system_msg:
+        if isinstance(system_msg, list):
+            system_msg = " ".join(b.get("text", "") for b in system_msg if b.get("type") == "text")
+        messages = [{"role": "user", "content": f"[System]: {system_msg}"}] + messages
+
+    if not pool.accounts:
+        raise HTTPException(503, "Nenhuma conta configurada. Acesse /admin para adicionar.")
+
+    last_error = None
+    tried: set = set()
+    max_attempts = min(MAX_RETRIES, len(pool.accounts))
+
+    for attempt in range(max_attempts):
+        account = pool.get_next_account()
+        if not account:
+            raise HTTPException(503, "Nenhuma conta ativa disponível")
+        if account.id in tried:
+            continue
+        tried.add(account.id)
+
+        logger.info(f"[Anthropic Attempt {attempt+1}] {account.id} | model={model}")
+
+        try:
+            access_token = await account.get_access_token()
+            url, headers, payload = _build_kiro_request(messages, model, access_token, account)
+
+            if stream:
+                return await _do_stream_anthropic(url, headers, payload, account, model)
+            else:
+                return await _do_normal_anthropic(url, headers, payload, account, model)
+
+        except AccountExhaustedException as e:
+            last_error = str(e)
+            pool.disable_account(account, str(e))
+            continue
+        except TokenRefreshFailedException as e:
+            last_error = str(e)
+            pool.disable_account(account, str(e))
+            continue
+        except httpx.TimeoutException:
+            last_error = "Timeout"
+            continue
+        except Exception as e:
+            last_error = str(e)
+            logger.error(f"[{account.id}] {e}")
+            continue
+
+    raise HTTPException(502, f"Todas tentativas falharam: {last_error}")
+
+
 # ─── Chat Completions (OpenAI format) ─────────────────────────────────────────
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
@@ -835,7 +904,6 @@ def _parse_kiro_event(line: str) -> Optional[str]:
     """Extrai texto de evento streaming Kiro."""
     try:
         data = json.loads(line)
-        # Vários formatos possíveis da API Kiro
         if "assistantResponseEvent" in data:
             return data["assistantResponseEvent"].get("content")
         if "contentBlockDelta" in data:
@@ -862,6 +930,69 @@ def _extract_full_response(text: str) -> str:
         if c:
             parts.append(c)
     return "".join(parts) if parts else text
+
+
+# ─── Anthropic Streaming ───────────────────────────────────────────────────────
+
+async def _do_stream_anthropic(url: str, headers: dict, payload: dict, account: KiroAccount, model: str):
+    """Streaming SSE no formato Anthropic."""
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    async def generate():
+        # Evento de início
+        yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':{'id':msg_id,'type':'message','role':'assistant','content':[],'model':model,'stop_reason':None,'stop_sequence':None,'usage':{'input_tokens':0,'output_tokens':0}}})}\n\n"
+        yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
+
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code in (401, 403):
+                    raise AccountExhaustedException(f"HTTP {resp.status_code}")
+                if resp.status_code == 429:
+                    raise AccountExhaustedException("Rate limited (429)")
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    raise AccountExhaustedException(f"HTTP {resp.status_code}: {body.decode()[:200]}")
+
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    content = _parse_kiro_event(line)
+                    if content:
+                        delta_event = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": content}}
+                        yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+        # Eventos de fim
+        yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
+        yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':{'output_tokens':0}})}\n\n"
+        yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
+
+async def _do_normal_anthropic(url: str, headers: dict, payload: dict, account: KiroAccount, model: str):
+    """Resposta normal no formato Anthropic."""
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code in (401, 403):
+            raise AccountExhaustedException(f"HTTP {resp.status_code}")
+        if resp.status_code == 429:
+            raise AccountExhaustedException("Rate limited")
+        if resp.status_code >= 400:
+            raise AccountExhaustedException(f"HTTP {resp.status_code}: {resp.text[:200]}")
+
+    content = _extract_full_response(resp.text)
+    return JSONResponse({
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": content}],
+        "model": model,
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    })
 
 
 # ─── Fallback Proxy ────────────────────────────────────────────────────────────
