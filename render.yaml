@@ -5,15 +5,21 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn main:app -c gunicorn_conf.py
     healthCheckPath: /health
+    disk:
+      name: kiro-data
+      mountPath: /tmp/kiro-data
+      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
-      - key: KIRO_ACCOUNTS
-        sync: false
       - key: GATEWAY_API_KEY
+        sync: false
+      - key: ADMIN_PASSWORD
         sync: false
       - key: KIRO_REGION
         value: "us-east-1"
+      - key: DATA_DIR
+        value: "/tmp/kiro-data"
       - key: MAX_RETRIES
         value: "3"
       - key: REQUEST_TIMEOUT
@@ -21,6 +27,6 @@ services:
       - key: ACCOUNT_COOLDOWN_SECONDS
         value: "300"
       - key: WEB_CONCURRENCY
-        value: "2"
+        value: "1"
       - key: GUNICORN_TIMEOUT
         value: "300"
