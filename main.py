@@ -12,6 +12,7 @@ import time
 import asyncio
 import hashlib
 import uuid
+import struct
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -959,7 +960,7 @@ def _build_kiro_request(messages: List[dict], model: str, access_token: str, acc
 # ─── Streaming ─────────────────────────────────────────────────────────────────
 
 async def _do_stream(url: str, headers: dict, payload: dict, account: KiroAccount):
-    """Streaming SSE no formato OpenAI."""
+    """Streaming SSE no formato OpenAI - parseia AWS Event Stream binário."""
 
     async def generate():
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -970,24 +971,43 @@ async def _do_stream(url: str, headers: dict, payload: dict, account: KiroAccoun
                     raise AccountExhaustedException("Rate limited (429)")
                 if resp.status_code >= 400:
                     body = await resp.aread()
-                    raise AccountExhaustedException(f"HTTP {resp.status_code}: {body.decode()[:200]}")
+                    raise AccountExhaustedException(f"HTTP {resp.status_code}: {body.decode('utf-8', errors='replace')[:200]}")
 
-                async for line in resp.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    content = _parse_kiro_event(line)
-                    if content:
-                        chunk = {
-                            "id": f"chatcmpl-{int(time.time())}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": "kiro",
-                            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
+                buffer = b""
+                async for chunk in resp.aiter_bytes():
+                    buffer += chunk
+                    events = parse_aws_event_stream(buffer)
+                    if events:
+                        consumed = 0
+                        offset = 0
+                        for _ in events:
+                            if offset + 4 > len(buffer):
+                                break
+                            total_len = struct.unpack(">I", buffer[offset:offset+4])[0]
+                            offset += total_len
+                            consumed = offset
+                        buffer = buffer[consumed:]
 
-        # Final
+                        for event in events:
+                            text = ""
+                            if "assistantResponseEvent" in event:
+                                text = event["assistantResponseEvent"].get("content", "")
+                            elif "messageStream" in event:
+                                ms = event["messageStream"]
+                                if "contentBlockDelta" in ms:
+                                    text = ms["contentBlockDelta"].get("delta", {}).get("text", "")
+                                elif "assistantResponseEvent" in ms:
+                                    text = ms["assistantResponseEvent"].get("content", "")
+                            if text:
+                                chunk_data = {
+                                    "id": f"chatcmpl-{int(time.time())}",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": "kiro",
+                                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(chunk_data)}\n\n"
+
         final = {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion.chunk",
@@ -1005,7 +1025,7 @@ async def _do_stream(url: str, headers: dict, payload: dict, account: KiroAccoun
 # ─── Normal Response ───────────────────────────────────────────────────────────
 
 async def _do_normal(url: str, headers: dict, payload: dict, account: KiroAccount):
-    """Request normal, retorna formato OpenAI."""
+    """Request normal, retorna formato OpenAI - parseia AWS Event Stream."""
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code in (401, 403):
@@ -1015,7 +1035,11 @@ async def _do_normal(url: str, headers: dict, payload: dict, account: KiroAccoun
         if resp.status_code >= 400:
             raise AccountExhaustedException(f"HTTP {resp.status_code}: {resp.text[:200]}")
 
-    content = _extract_full_response(resp.text)
+    events = parse_aws_event_stream(resp.content)
+    content = extract_text_from_kiro_events(events)
+    if not content:
+        content = resp.text[:500]
+
     return JSONResponse({
         "id": f"chatcmpl-{int(time.time())}",
         "object": "chat.completion",
@@ -1026,48 +1050,78 @@ async def _do_normal(url: str, headers: dict, payload: dict, account: KiroAccoun
     })
 
 
-# ─── Parsers Kiro ──────────────────────────────────────────────────────────────
+# ─── AWS Event Stream Parser ───────────────────────────────────────────────────
 
-def _parse_kiro_event(line: str) -> Optional[str]:
-    """Extrai texto de evento streaming Kiro."""
-    try:
-        data = json.loads(line)
-        if "assistantResponseEvent" in data:
-            return data["assistantResponseEvent"].get("content")
-        if "contentBlockDelta" in data:
-            return data["contentBlockDelta"].get("delta", {}).get("text")
-        if "messageStream" in data:
-            ms = data["messageStream"]
-            if "contentBlockDelta" in ms:
-                return ms["contentBlockDelta"].get("delta", {}).get("text")
-            if "assistantResponseEvent" in ms:
-                return ms["assistantResponseEvent"].get("content")
-        if "text" in data:
-            return data["text"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        if line and not line.startswith(("{", ":")):
-            return line
-    return None
+import struct
 
 
-def _extract_full_response(text: str) -> str:
-    """Extrai conteúdo completo de resposta não-streaming."""
+def parse_aws_event_stream(data: bytes) -> List[dict]:
+    """
+    Parseia o formato AWS Event Stream (binário).
+    Cada evento tem: 4 bytes total_length, 4 bytes headers_length, 4 bytes prelude_crc,
+    headers, payload, 4 bytes message_crc.
+    """
+    events = []
+    offset = 0
+    while offset < len(data):
+        if offset + 12 > len(data):
+            break
+        total_length = struct.unpack(">I", data[offset:offset+4])[0]
+        headers_length = struct.unpack(">I", data[offset+4:offset+8])[0]
+
+        if offset + total_length > len(data):
+            break
+
+        # Skip prelude CRC (4 bytes)
+        headers_start = offset + 12
+        headers_end = headers_start + headers_length
+        payload_start = headers_end
+        payload_end = offset + total_length - 4  # minus message CRC
+
+        payload = data[payload_start:payload_end]
+
+        if payload:
+            try:
+                event_data = json.loads(payload.decode("utf-8"))
+                events.append(event_data)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
+        offset += total_length
+
+    return events
+
+
+def extract_text_from_kiro_events(events: List[dict]) -> str:
+    """Extrai texto dos eventos parseados do Kiro."""
     parts = []
-    for line in text.split("\n"):
-        c = _parse_kiro_event(line.strip())
-        if c:
-            parts.append(c)
-    return "".join(parts) if parts else text
+    for event in events:
+        # Formato: {"assistantResponseEvent": {"content": "text"}}
+        if "assistantResponseEvent" in event:
+            content = event["assistantResponseEvent"].get("content", "")
+            if content:
+                parts.append(content)
+        # Formato: {"messageStream": {"contentBlockDelta": {"delta": {"text": "..."}}}}
+        elif "messageStream" in event:
+            ms = event["messageStream"]
+            if "contentBlockDelta" in ms:
+                text = ms["contentBlockDelta"].get("delta", {}).get("text", "")
+                if text:
+                    parts.append(text)
+            elif "assistantResponseEvent" in ms:
+                content = ms["assistantResponseEvent"].get("content", "")
+                if content:
+                    parts.append(content)
+    return "".join(parts)
 
 
 # ─── Anthropic Streaming ───────────────────────────────────────────────────────
 
 async def _do_stream_anthropic(url: str, headers: dict, payload: dict, account: KiroAccount, model: str):
-    """Streaming SSE no formato Anthropic."""
+    """Streaming SSE no formato Anthropic - parseia AWS Event Stream binário."""
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     async def generate():
-        # Evento de início
         yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':{'id':msg_id,'type':'message','role':'assistant','content':[],'model':model,'stop_reason':None,'stop_sequence':None,'usage':{'input_tokens':0,'output_tokens':0}}})}\n\n"
         yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
 
@@ -1079,18 +1133,40 @@ async def _do_stream_anthropic(url: str, headers: dict, payload: dict, account: 
                     raise AccountExhaustedException("Rate limited (429)")
                 if resp.status_code >= 400:
                     body = await resp.aread()
-                    raise AccountExhaustedException(f"HTTP {resp.status_code}: {body.decode()[:200]}")
+                    raise AccountExhaustedException(f"HTTP {resp.status_code}: {body.decode('utf-8', errors='replace')[:200]}")
 
-                async for line in resp.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    content = _parse_kiro_event(line)
-                    if content:
-                        delta_event = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": content}}
-                        yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+                buffer = b""
+                async for chunk in resp.aiter_bytes():
+                    buffer += chunk
+                    # Tenta parsear eventos completos do buffer
+                    events = parse_aws_event_stream(buffer)
+                    if events:
+                        # Calcula quanto foi consumido
+                        consumed = 0
+                        offset = 0
+                        for _ in events:
+                            if offset + 4 > len(buffer):
+                                break
+                            total_len = struct.unpack(">I", buffer[offset:offset+4])[0]
+                            offset += total_len
+                            consumed = offset
+                        buffer = buffer[consumed:]
 
-        # Eventos de fim
+                        for event in events:
+                            text = ""
+                            if "assistantResponseEvent" in event:
+                                text = event["assistantResponseEvent"].get("content", "")
+                            elif "messageStream" in event:
+                                ms = event["messageStream"]
+                                if "contentBlockDelta" in ms:
+                                    text = ms["contentBlockDelta"].get("delta", {}).get("text", "")
+                                elif "assistantResponseEvent" in ms:
+                                    text = ms["assistantResponseEvent"].get("content", "")
+
+                            if text:
+                                delta_event = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}
+                                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
         yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
         yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':{'output_tokens':0}})}\n\n"
         yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
@@ -1100,7 +1176,7 @@ async def _do_stream_anthropic(url: str, headers: dict, payload: dict, account: 
 
 
 async def _do_normal_anthropic(url: str, headers: dict, payload: dict, account: KiroAccount, model: str):
-    """Resposta normal no formato Anthropic."""
+    """Resposta normal no formato Anthropic - parseia AWS Event Stream."""
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code in (401, 403):
@@ -1110,7 +1186,11 @@ async def _do_normal_anthropic(url: str, headers: dict, payload: dict, account: 
         if resp.status_code >= 400:
             raise AccountExhaustedException(f"HTTP {resp.status_code}: {resp.text[:200]}")
 
-    content = _extract_full_response(resp.text)
+    events = parse_aws_event_stream(resp.content)
+    content = extract_text_from_kiro_events(events)
+    if not content:
+        content = resp.text[:500]
+
     return JSONResponse({
         "id": f"msg_{uuid.uuid4().hex[:24]}",
         "type": "message",
