@@ -36,7 +36,7 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 ACCOUNT_COOLDOWN = int(os.getenv("ACCOUNT_COOLDOWN_SECONDS", "300"))
 REGION = os.getenv("KIRO_REGION", "us-east-1")
-DATA_DIR = os.getenv("DATA_DIR", "/tmp/kiro-data")
+DATA_DIR = os.getenv("DATA_DIR", "./data")
 
 # URLs Kiro
 KIRO_REFRESH_URL = f"https://prod.{REGION}.auth.desktop.kiro.dev/refreshToken"
