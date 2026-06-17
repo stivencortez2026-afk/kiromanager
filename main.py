@@ -49,10 +49,22 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 async def verify_api_key(api_key: Optional[str] = Depends(api_key_header)):
     if not GATEWAY_API_KEY:
         return True
-    # Aceita via header X-API-Key ou Authorization Bearer
+    # Admin master key
     if api_key == GATEWAY_API_KEY:
         return True
-    raise HTTPException(status_code=401, detail="X-API-Key inválida")
+    # Generated API keys
+    if api_key and key_manager.validate_key(api_key):
+        return True
+    raise HTTPException(status_code=401, detail="API Key inválida ou desativada")
+
+
+async def verify_admin_key(api_key: Optional[str] = Depends(api_key_header)):
+    """Só aceita a master key (admin)."""
+    if not GATEWAY_API_KEY:
+        return True
+    if api_key == GATEWAY_API_KEY:
+        return True
+    raise HTTPException(status_code=401, detail="Acesso admin requer GATEWAY_API_KEY")
 
 
 def get_fingerprint() -> str:
@@ -66,6 +78,7 @@ FINGERPRINT = get_fingerprint()
 # ─── Persistência JSON ─────────────────────────────────────────────────────────
 
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
+API_KEYS_FILE = os.path.join(DATA_DIR, "api_keys.json")
 
 
 def _ensure_data_dir():
@@ -73,7 +86,6 @@ def _ensure_data_dir():
 
 
 def load_accounts_from_disk() -> List[dict]:
-    """Carrega contas do arquivo JSON."""
     _ensure_data_dir()
     if not os.path.exists(ACCOUNTS_FILE):
         return []
@@ -85,10 +97,87 @@ def load_accounts_from_disk() -> List[dict]:
 
 
 def save_accounts_to_disk(accounts_data: List[dict]):
-    """Salva contas no arquivo JSON."""
     _ensure_data_dir()
     with open(ACCOUNTS_FILE, "w") as f:
         json.dump(accounts_data, f, indent=2)
+
+
+def load_api_keys_from_disk() -> List[dict]:
+    _ensure_data_dir()
+    if not os.path.exists(API_KEYS_FILE):
+        return []
+    try:
+        with open(API_KEYS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_api_keys_to_disk(keys_data: List[dict]):
+    _ensure_data_dir()
+    with open(API_KEYS_FILE, "w") as f:
+        json.dump(keys_data, f, indent=2)
+
+
+# ─── API Key Manager ──────────────────────────────────────────────────────────
+
+class ApiKeyManager:
+    """Gerencia API keys geradas pelo admin."""
+
+    def __init__(self):
+        self.keys: List[dict] = load_api_keys_from_disk()
+
+    def _save(self):
+        save_api_keys_to_disk(self.keys)
+
+    def generate_key(self, name: str = "") -> dict:
+        """Gera uma nova API key."""
+        key = f"sk-kiro-{uuid.uuid4().hex[:24]}"
+        entry = {
+            "key": key,
+            "name": name or f"Key {len(self.keys) + 1}",
+            "active": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "last_used": None,
+            "requests": 0,
+        }
+        self.keys.append(entry)
+        self._save()
+        return entry
+
+    def validate_key(self, key: str) -> bool:
+        """Verifica se a key é válida e está ativa."""
+        for entry in self.keys:
+            if entry["key"] == key and entry["active"]:
+                entry["last_used"] = datetime.now(timezone.utc).isoformat()
+                entry["requests"] += 1
+                self._save()
+                return True
+        return False
+
+    def toggle_key(self, key: str) -> Optional[dict]:
+        """Ativa/desativa uma key."""
+        for entry in self.keys:
+            if entry["key"] == key:
+                entry["active"] = not entry["active"]
+                self._save()
+                return entry
+        return None
+
+    def delete_key(self, key: str) -> bool:
+        """Remove uma key."""
+        before = len(self.keys)
+        self.keys = [k for k in self.keys if k["key"] != key]
+        if len(self.keys) < before:
+            self._save()
+            return True
+        return False
+
+    def list_keys(self) -> List[dict]:
+        return self.keys
+
+
+key_manager = ApiKeyManager()
 
 
 # ─── Kiro Account Class ───────────────────────────────────────────────────────
@@ -351,10 +440,22 @@ ADMIN_HTML2 = """
 </table>
 </div>
 <div class="card">
+<h2>API Keys</h2>
+<p style="color:#888;margin-bottom:15px;font-size:0.9em;">Gere chaves para distribuir a clientes. Cada key pode ser ativada/desativada individualmente.</p>
+<div class="form-row" style="margin-bottom:15px;">
+<input type="text" id="keyname" placeholder="Nome da key (ex: Claude Desktop, Notebook 1)">
+<button onclick="generateKey()">Gerar Key</button>
+</div>
+<table>
+<thead><tr><th>Nome</th><th>Key</th><th>Status</th><th>Requests</th><th>Última Uso</th><th></th><th></th></tr></thead>
+<tbody id="apikeys"></tbody>
+</table>
+</div>
+<div class="card">
 <h2>Como usar</h2>
 <p style="color:#aaa; line-height:1.8;">
 <strong>Base URL:</strong> <code style="color:#4fc3f7;">ESTE_DOMINIO/v1</code><br>
-<strong>API Key:</strong> Sua GATEWAY_API_KEY (header X-API-Key ou Authorization Bearer)<br>
+<strong>API Key:</strong> Use uma key gerada acima (header X-API-Key ou Authorization Bearer)<br>
 <strong>Endpoint:</strong> POST /v1/chat/completions (formato OpenAI)<br>
 <strong>Modelos:</strong> auto, claude-sonnet-4, claude-sonnet-4.5, claude-haiku-4.5
 </p>
@@ -370,7 +471,7 @@ async function loadData() {
     if (r.status === 401) { showMsg("Senha incorreta!", true); return; }
     const d = await r.json();
     document.getElementById("stats").innerHTML = `
-      <div class="stat"><div class="number">${d.total}</div><div class="label">Total</div></div>
+      <div class="stat"><div class="number">${d.total}</div><div class="label">Total Contas</div></div>
       <div class="stat"><div class="number">${d.active}</div><div class="label">Ativas</div></div>
       <div class="stat"><div class="number">${d.requests}</div><div class="label">Requests</div></div>
     `;
@@ -384,7 +485,50 @@ async function loadData() {
       </tr>`;
     }
     document.getElementById("accounts").innerHTML = rows || "<tr><td colspan=6 style='color:#888'>Nenhuma conta. Adicione acima.</td></tr>";
+
+    // API Keys
+    let keyRows = "";
+    for (const k of (d.api_keys || [])) {
+      const badge = k.active ? '<span class="badge badge-green">Ativa</span>' : '<span class="badge badge-red">Inativa</span>';
+      const toggleLabel = k.active ? "Desativar" : "Ativar";
+      const lastUsed = k.last_used ? new Date(k.last_used).toLocaleString() : "Nunca";
+      keyRows += `<tr>
+        <td>${k.name}</td>
+        <td><code style="font-size:0.75em;color:#4fc3f7;cursor:pointer;" onclick="copyKey('${k.key}')">${k.key.substring(0,20)}... 📋</code></td>
+        <td>${badge}</td><td>${k.requests}</td><td style="font-size:0.8em;">${lastUsed}</td>
+        <td><button style="font-size:0.8em;padding:5px 10px;" onclick="toggleKey('${k.key}')">${toggleLabel}</button></td>
+        <td><button class="danger" style="font-size:0.8em;padding:5px 10px;" onclick="deleteKey('${k.key}')">X</button></td>
+      </tr>`;
+    }
+    document.getElementById("apikeys").innerHTML = keyRows || "<tr><td colspan=7 style='color:#888'>Nenhuma key gerada.</td></tr>";
   } catch(e) { showMsg("Erro: " + e.message, true); }
+}
+
+function copyKey(key) {
+  navigator.clipboard.writeText(key);
+  showMsg("Key copiada!");
+}
+
+async function generateKey() {
+  const name = document.getElementById("keyname").value.trim();
+  const r = await fetch("/admin/api/keys", {method:"POST", headers:H, body: JSON.stringify({name})});
+  if (r.ok) {
+    const d = await r.json();
+    showMsg("Key gerada: " + d.key.key);
+    document.getElementById("keyname").value = "";
+    loadData();
+  } else { showMsg("Erro ao gerar key", true); }
+}
+
+async function toggleKey(key) {
+  await fetch("/admin/api/keys/" + encodeURIComponent(key) + "/toggle", {method:"PUT", headers:H});
+  loadData();
+}
+
+async function deleteKey(key) {
+  if (!confirm("Deletar esta key?")) return;
+  await fetch("/admin/api/keys/" + encodeURIComponent(key), {method:"DELETE", headers:H});
+  loadData();
 }
 
 async function addAccount() {
@@ -422,12 +566,12 @@ async def admin_panel():
     return HTMLResponse(ADMIN_HTML + ADMIN_HTML2)
 
 
-@app.get("/admin/api/stats", dependencies=[Depends(verify_api_key)])
+@app.get("/admin/api/stats", dependencies=[Depends(verify_admin_key)])
 async def admin_stats():
-    return pool.get_stats()
+    return {**pool.get_stats(), "api_keys": key_manager.list_keys()}
 
 
-@app.post("/admin/api/accounts", dependencies=[Depends(verify_api_key)])
+@app.post("/admin/api/accounts", dependencies=[Depends(verify_admin_key)])
 async def admin_add_account(request: Request):
     """Adiciona conta via admin."""
     body = await request.json()
@@ -445,12 +589,38 @@ async def admin_add_account(request: Request):
         return {"status": "warning", "id": acc.id, "message": f"Conta adicionada mas refresh falhou: {e}"}
 
 
-@app.delete("/admin/api/accounts/{account_id}", dependencies=[Depends(verify_api_key)])
+@app.delete("/admin/api/accounts/{account_id}", dependencies=[Depends(verify_admin_key)])
 async def admin_remove_account(account_id: str):
     """Remove conta via admin."""
     if pool.remove_account(account_id):
         return {"status": "ok"}
     raise HTTPException(404, "Conta não encontrada")
+
+
+@app.post("/admin/api/keys", dependencies=[Depends(verify_admin_key)])
+async def admin_generate_key(request: Request):
+    """Gera nova API key."""
+    body = await request.json()
+    name = body.get("name", "").strip()
+    entry = key_manager.generate_key(name)
+    return {"status": "ok", "key": entry}
+
+
+@app.put("/admin/api/keys/{key}/toggle", dependencies=[Depends(verify_admin_key)])
+async def admin_toggle_key(key: str):
+    """Ativa/desativa uma API key."""
+    entry = key_manager.toggle_key(key)
+    if entry:
+        return {"status": "ok", "key": entry}
+    raise HTTPException(404, "Key não encontrada")
+
+
+@app.delete("/admin/api/keys/{key}", dependencies=[Depends(verify_admin_key)])
+async def admin_delete_key(key: str):
+    """Deleta uma API key."""
+    if key_manager.delete_key(key):
+        return {"status": "ok"}
+    raise HTTPException(404, "Key não encontrada")
 
 
 # ─── Health & Models ───────────────────────────────────────────────────────────
