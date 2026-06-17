@@ -1,0 +1,27 @@
+# Render.com Blueprint - Deploy automático
+services:
+  - type: web
+    name: kiro-gateway
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app -c gunicorn_conf.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: KIRO_BASE_URL
+        sync: false
+      - key: KIRO_TOKENS
+        sync: false
+      - key: GATEWAY_API_KEY
+        sync: false
+      - key: MAX_RETRIES
+        value: "3"
+      - key: REQUEST_TIMEOUT
+        value: "120"
+      - key: ACCOUNT_COOLDOWN_SECONDS
+        value: "300"
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: GUNICORN_TIMEOUT
+        value: "300"
