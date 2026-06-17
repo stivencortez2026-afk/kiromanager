@@ -272,7 +272,62 @@ class KiroAccount:
             "errors": self.errors,
             "last_error": self.last_error,
             "last_used": self.last_used,
+            "credits": None,
         }
+
+    async def check_credits(self) -> dict:
+        """Consulta créditos da conta via getUsageLimits."""
+        try:
+            access_token = await self.get_access_token()
+            url = f"https://q.{REGION}.amazonaws.com/getUsageLimits"
+            params = {
+                "origin": "AI_EDITOR",
+                "resourceType": "AGENTIC_REQUEST",
+            }
+            if self.profile_arn:
+                params["profileArn"] = self.profile_arn
+
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+                "User-Agent": f"KiroIDE-0.7.45-{FINGERPRINT}",
+            }
+
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                if resp.status_code != 200:
+                    return {"error": f"HTTP {resp.status_code}: {resp.text[:100]}"}
+                data = resp.json()
+
+            # Extrai info de créditos
+            usage_list = data.get("usageBreakdownList", [])
+            result = {"raw": data, "credits": []}
+            for item in usage_list:
+                credit_info = {
+                    "type": item.get("type", "UNKNOWN"),
+                    "used": item.get("currentUsage", 0),
+                    "limit": item.get("usageLimit", 0),
+                    "reset_date": item.get("resetDate", ""),
+                }
+                # Free trial info
+                if "freeTrialUsage" in item:
+                    ft = item["freeTrialUsage"]
+                    credit_info["free_trial"] = {
+                        "used": ft.get("currentUsage", 0),
+                        "limit": ft.get("usageLimit", 0),
+                        "expires": ft.get("expiryDate", ""),
+                        "days_remaining": ft.get("daysRemaining", 0),
+                    }
+                result["credits"].append(credit_info)
+
+            # Subscription info
+            sub = data.get("subscriptionInfo", {})
+            if sub:
+                result["plan"] = sub.get("subscriptionTitle", "Unknown")
+
+            return result
+        except Exception as e:
+            return {"error": str(e)}
 
 
 # ─── Account Pool ─────────────────────────────────────────────────────────────
@@ -442,7 +497,7 @@ ADMIN_HTML2 = """
 <h2>Pool de Contas</h2>
 <div class="stats" id="stats"></div>
 <table>
-<thead><tr><th>Nome</th><th>Status</th><th>Requests</th><th>Erros</th><th>Último Erro</th><th></th></tr></thead>
+<thead><tr><th>Nome</th><th>Status</th><th>Requests</th><th>Erros</th><th>Último Erro</th><th>Créditos</th><th></th></tr></thead>
 <tbody id="accounts"></tbody>
 </table>
 </div>
@@ -488,10 +543,11 @@ async function loadData() {
       rows += `<tr>
         <td>${a.label}</td><td>${badge}</td><td>${a.requests}</td><td>${a.errors}</td>
         <td style="color:#ef5350;font-size:0.8em;">${a.last_error||"-"}</td>
+        <td><button style="font-size:0.8em;padding:5px 10px;" onclick="checkCredits('${a.id}')">Ver</button> <span id="credits-${a.id}" style="font-size:0.8em;"></span></td>
         <td><button class="danger" onclick="removeAccount('${a.id}')">X</button></td>
       </tr>`;
     }
-    document.getElementById("accounts").innerHTML = rows || "<tr><td colspan=6 style='color:#888'>Nenhuma conta. Adicione acima.</td></tr>";
+    document.getElementById("accounts").innerHTML = rows || "<tr><td colspan=7 style='color:#888'>Nenhuma conta. Adicione acima.</td></tr>";
 
     // API Keys
     let keyRows = "";
@@ -536,6 +592,28 @@ async function deleteKey(key) {
   if (!confirm("Deletar esta key?")) return;
   await fetch("/admin/api/keys/" + encodeURIComponent(key), {method:"DELETE", headers:H});
   loadData();
+}
+
+async function checkCredits(id) {
+  const el = document.getElementById("credits-" + id);
+  el.textContent = "Carregando...";
+  el.style.color = "#888";
+  try {
+    const r = await fetch("/admin/api/accounts/" + id + "/credits", {headers: H});
+    const d = await r.json();
+    if (d.error) { el.textContent = d.error; el.style.color = "#ef5350"; return; }
+    if (d.credits && d.credits.length > 0) {
+      const c = d.credits[0];
+      let txt = c.used + "/" + c.limit;
+      if (c.free_trial) { txt += " (Trial: " + c.free_trial.used.toFixed(1) + "/" + c.free_trial.limit + ")"; }
+      if (d.plan) { txt += " [" + d.plan + "]"; }
+      el.textContent = txt;
+      el.style.color = "#4fc3f7";
+    } else {
+      el.textContent = "Sem dados";
+      el.style.color = "#888";
+    }
+  } catch(e) { el.textContent = "Erro"; el.style.color = "#ef5350"; }
 }
 
 async function addAccount() {
@@ -628,6 +706,16 @@ async def admin_delete_key(key: str):
     if key_manager.delete_key(key):
         return {"status": "ok"}
     raise HTTPException(404, "Key não encontrada")
+
+
+@app.get("/admin/api/accounts/{account_id}/credits", dependencies=[Depends(verify_admin_key)])
+async def admin_check_credits(account_id: str):
+    """Consulta créditos de uma conta."""
+    for acc in pool.accounts:
+        if acc.id == account_id:
+            result = await acc.check_credits()
+            return result
+    raise HTTPException(404, "Conta não encontrada")
 
 
 # ─── Health & Models ───────────────────────────────────────────────────────────
